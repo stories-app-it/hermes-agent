@@ -1,0 +1,6 @@
+name: tts-local-engine
+version: 0.1.0
+description: "Generic HTTP bridge to a locally-hosted TTS engine server (Sibilia-TTS and future local engines: Azzurra-Voice, Kokoro-82M/Pocket-TTS, ChatTTS, F5-TTS). Posts {text, voice, params} to a configured endpoint and writes the returned audio bytes to output_path."
+kind: backend
+provides_tts_providers:
+  - local_engine
