@@ -551,6 +551,20 @@ def _dispatch_to_plugin_provider(
         else DEFAULT_COMMAND_TTS_OUTPUT_FORMAT
     )
 
+    # Provider-specific config (e.g. ``endpoint``/``timeout`` for
+    # LocalEngineTTSProvider) lives under ``tts.<provider-name>`` in
+    # config.yaml, not at the top level — without forwarding it here, a
+    # plugin's ``**extra`` is always empty regardless of what's
+    # configured, and any provider that requires per-instance config
+    # (like an HTTP endpoint) can never actually run. Named kwargs
+    # resolved above win on collision so a provider can't override its
+    # own voice/model/speed/format via its config section.
+    extra_config = _get_provider_section(tts_config, key)
+    extra_config = {
+        k: v for k, v in extra_config.items()
+        if k not in {"voice", "model", "speed", "format"}
+    }
+
     logger.info(
         "Generating speech with plugin TTS provider '%s'...", key,
     )
@@ -561,6 +575,7 @@ def _dispatch_to_plugin_provider(
         model=model if isinstance(model, str) and model else None,
         speed=float(speed) if isinstance(speed, (int, float)) else None,
         format=str(fmt).lower() if fmt else "mp3",
+        **extra_config,
     )
     # Provider contract: returns the (possibly rewritten) output path.
     # Defensive against a provider returning None or a non-string —
