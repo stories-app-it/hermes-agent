@@ -538,17 +538,33 @@ def _dispatch_to_plugin_provider(
     if plugin_provider is None:
         return None
 
-    # Resolve voice / model / format from tts_config — providers should
-    # treat all of these as optional and fall back to their own defaults
-    # when None is passed (matches the ABC contract documented on
-    # ``TTSProvider.synthesize``).
-    voice = tts_config.get("voice") if isinstance(tts_config, dict) else None
-    model = tts_config.get("model") if isinstance(tts_config, dict) else None
-    speed = tts_config.get("speed") if isinstance(tts_config, dict) else None
+    # Resolve voice / model / format from the provider's own config
+    # section (``tts.<provider-name>.*``, e.g. ``tts.azure.voice``) —
+    # this is where ``apply_tts_settings``/``hermes_profiles.py`` actually
+    # writes them. Reading them from the top-level ``tts_config`` instead
+    # (the previous behaviour) meant these three were always ``None`` for
+    # every plugin provider, silently discarding whatever voice/model/speed
+    # the user configured and falling back to the provider's own hardcoded
+    # default every time (regression: voice/speed appeared "stuck" no
+    # matter what was set in the TTS settings UI). ``.get("voice")`` at the
+    # top level is kept as a fallback for any legacy config still written
+    # there. Providers should treat all of these as optional and fall back
+    # to their own defaults when None is passed (matches the ABC contract
+    # documented on ``TTSProvider.synthesize``).
+    provider_section = _get_provider_section(tts_config, key)
+    voice = provider_section.get("voice") or (
+        tts_config.get("voice") if isinstance(tts_config, dict) else None
+    )
+    model = provider_section.get("model") or (
+        tts_config.get("model") if isinstance(tts_config, dict) else None
+    )
+    speed = provider_section.get("speed")
+    if speed is None:
+        speed = tts_config.get("speed") if isinstance(tts_config, dict) else None
     fmt = (
-        tts_config.get("output_format", DEFAULT_COMMAND_TTS_OUTPUT_FORMAT)
-        if isinstance(tts_config, dict)
-        else DEFAULT_COMMAND_TTS_OUTPUT_FORMAT
+        provider_section.get("format")
+        or (tts_config.get("output_format") if isinstance(tts_config, dict) else None)
+        or DEFAULT_COMMAND_TTS_OUTPUT_FORMAT
     )
 
     # Provider-specific config (e.g. ``endpoint``/``timeout`` for
@@ -559,7 +575,7 @@ def _dispatch_to_plugin_provider(
     # (like an HTTP endpoint) can never actually run. Named kwargs
     # resolved above win on collision so a provider can't override its
     # own voice/model/speed/format via its config section.
-    extra_config = _get_provider_section(tts_config, key)
+    extra_config = provider_section
     extra_config = {
         k: v for k, v in extra_config.items()
         if k not in {"voice", "model", "speed", "format"}

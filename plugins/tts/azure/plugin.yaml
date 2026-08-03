@@ -1,0 +1,6 @@
+name: tts-azure
+version: 0.1.0
+description: "Microsoft Speech (Azure AI Speech) REST TTS provider. Synthesizes via SSML against {region}.tts.speech.microsoft.com/cognitiveservices/v1, autenticato con AZURE_SPEECH_KEY/AZURE_SPEECH_REGION."
+kind: backend
+provides_tts_providers:
+  - azure
