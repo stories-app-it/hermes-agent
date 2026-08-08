@@ -2318,6 +2318,7 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 def text_to_speech_tool(
     text: str,
     output_path: Optional[str] = None,
+    tts_config: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Convert text to speech audio.
@@ -2332,6 +2333,12 @@ def text_to_speech_tool(
     Args:
         text: The text to convert to speech.
         output_path: Optional custom save path. Defaults to ~/voice-memos/<timestamp>.mp3
+        tts_config: Optional pre-resolved ``tts:`` section. When given, it is
+            used verbatim instead of reading ~/.hermes/config.yaml. Callers
+            that synthesize with per-request voice/prosody (e.g. one profile
+            per concurrent user) can then pass parameters by argument instead
+            of rewriting the profile's config.yaml around every call, which is
+            process-global mutable state and not concurrency-safe.
 
     Returns:
         str: JSON result with success, file_path, and optionally MEDIA tag.
@@ -2339,7 +2346,8 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
-    tts_config = _load_tts_config()
+    if tts_config is None:
+        tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
 
     # User-declared command provider (type: command under tts.providers.<name>)
