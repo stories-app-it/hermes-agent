@@ -340,9 +340,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
     # Stable for the lifetime of the process.
-    _env_hints = _r.build_environment_hints()
-    if _env_hints:
-        stable_parts.append(_env_hints)
+    #
+    # Gated on tools, like TASK_COMPLETION_GUIDANCE, PARALLEL_TOOL_CALL_GUIDANCE
+    # and STEER_CHANNEL_NOTE above: an agent with no tools cannot read a file,
+    # run a command or translate a path, so host OS, $HOME, cwd and the
+    # Windows /mnt/c/ mapping describe capabilities it does not have. On a
+    # conversational surface this is not just dead weight — it is the only part
+    # of the prompt that can make the model mention filesystem paths to a user
+    # who should never see them.
+    if agent.valid_tool_names:
+        _env_hints = _r.build_environment_hints()
+        if _env_hints:
+            stable_parts.append(_env_hints)
 
     # Coding posture (base Hermes, any interactive coding surface in a code
     # workspace — see agent/coding_context.py). The operating brief + the live
@@ -388,11 +397,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # mid-session, so this doesn't break the prompt cache.
     # See file_safety._resolve_active_profile_name + classify_cross_profile_target
     # for the matching tool-side guard.
-    try:
-        from agent.file_safety import _resolve_active_profile_name
-        active_profile = _resolve_active_profile_name()
-    except Exception:
-        active_profile = "default"
+    #
+    # Gated on tools for the same reason as the environment hints above: every
+    # sentence in both branches is about *writing* to a profile directory, and
+    # names the tool-side guard that enforces it. With no tools loaded there is
+    # nothing to warn about, and the note is the last thing in the prompt that
+    # leaks the on-disk layout to a surface that never touches disk.
+    if not agent.valid_tool_names:
+        active_profile = None
+    else:
+        try:
+            from agent.file_safety import _resolve_active_profile_name
+            active_profile = _resolve_active_profile_name()
+        except Exception:
+            active_profile = "default"
     if active_profile == "default":
         stable_parts.append(
             "Active Hermes profile: default. Other profiles (if any) live "
@@ -402,7 +420,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             "skills/plugins/cron/memories unless the user explicitly directs "
             "you to."
         )
-    else:
+    elif active_profile:
         stable_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
             f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "

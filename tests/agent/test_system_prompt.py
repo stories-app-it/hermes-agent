@@ -145,3 +145,37 @@ class TestTelegramRichMessagesHint:
             stable = _stable_prompt(agent)
         assert "Standard Markdown is automatically converted" in stable
         assert "lean into it" not in stable
+
+
+class TestToollessSurfacesSkipHostContext:
+    """A toolless agent gets no environment hints and no active-profile note.
+
+    Both blocks describe things only a tool can do: translating a host path,
+    reading $HOME, refusing a cross-profile write. They sat outside any gate
+    while `TASK_COMPLETION_GUIDANCE`, `PARALLEL_TOOL_CALL_GUIDANCE` and
+    `STEER_CHANNEL_NOTE` were already gated on `valid_tool_names`, so a
+    conversational surface with no tools was still told where the user's
+    Windows Desktop lives and which profile directories not to modify.
+
+    On such a surface it is not only dead weight: it is the only part of the
+    prompt that can make the model mention filesystem paths to a person who
+    should never see them.
+    """
+
+    def test_no_environment_hints_without_tools(self):
+        parts = build_system_prompt_parts(_make_agent(valid_tool_names=[]))
+
+        assert "/mnt/c/" not in parts["stable"]
+        assert "Python toolchain" not in parts["stable"]
+
+    def test_no_active_profile_note_without_tools(self):
+        parts = build_system_prompt_parts(_make_agent(valid_tool_names=[]))
+
+        assert "Active Hermes profile" not in parts["stable"]
+
+    def test_active_profile_note_returns_with_tools(self):
+        """The gate must not silently remove the note from agents that *do*
+        have tools: for them the cross-profile warning is the whole point."""
+        parts = build_system_prompt_parts(_make_agent(valid_tool_names=["memory"]))
+
+        assert "Active Hermes profile" in parts["stable"]
