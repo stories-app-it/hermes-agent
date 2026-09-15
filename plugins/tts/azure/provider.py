@@ -8,12 +8,15 @@ flow documented in ``analisi_tts/Stories_tts_setup_provider.md``.
 
 from __future__ import annotations
 
+import http.cookiejar
 import logging
 import re
+import threading
 from typing import Any, Dict, List, Optional
 from xml.sax.saxutils import escape
 
 import requests
+import requests.adapters
 
 from agent.tts_provider import DEFAULT_OUTPUT_FORMAT, TTSProvider
 from hermes_cli.config import get_env_value
@@ -50,6 +53,39 @@ _OUTPUT_FORMAT_MAP = {
     "opus": "ogg-24khz-16bit-mono-opus",
     "flac": "riff-24khz-16bit-mono-pcm",
 }
+
+
+# Connessione riusata fra una sintesi e l'altra (Stories, 15-09-2026).
+#
+# Stories sintetizza **frase per frase**, non a risposta intera, quindi con un
+# `requests.post` diretto l'apertura di connessione si pagava una volta per
+# frase. Misurato verso `northeurope`: ~117 ms di mediana (TCP ~60, TLS 1.3
+# ~58), cioe' 350-470 ms per turno su una risposta di 3-4 frasi.
+#
+# Il pool e' dimensionato di proposito e non ereditato: il default di requests
+# e' 10 connessioni per host, e con una sessione unica di processo quel numero
+# diventa il tetto di conversazioni che possono sintetizzare insieme senza
+# ributtare via la connessione dopo l'uso. 32 copre l'MVP con margine e costa
+# solo descrittori di socket inattivi.
+_POOL_CONNESSIONI = 4
+_POOL_MAXSIZE = 32
+
+# La sessione e' condivisa fra famiglie diverse, quindi non deve accumulare
+# stato fra una richiesta e l'altra. Il corpo e gli header viaggiano gia'
+# per-richiesta; i cookie no, sarebbero l'unica cosa che una risposta puo'
+# lasciare attaccata alla sessione e che partirebbe con la richiesta di un
+# altro anziano. `audio_pipeline.py` di Stories documenta il guasto peggiore
+# che questo percorso possa produrre — «una frase sbagliata nella voce di
+# qualcun altro» — e questa e' la porta chiusa prima di aprirla.
+_POLITICA_SENZA_COOKIE = http.cookiejar.DefaultCookiePolicy(allowed_domains=[])
+
+# Protegge la sola costruzione della sessione, che avviene una volta. Il
+# provider e' un singleton di processo (`tts_registry` lo registra una volta),
+# quindi `synthesize()` puo' entrare da piu' thread insieme: senza lock due
+# sintesi concorrenti al primo giro costruirebbero due sessioni e una delle due
+# verrebbe buttata via. Il pool di urllib3 sotto e' gia' thread-safe, quindi
+# oltre la costruzione non serve altro.
+_lock_sessione = threading.Lock()
 
 
 class AzureSpeechTTSProvider(TTSProvider):
@@ -129,6 +165,35 @@ class AzureSpeechTTSProvider(TTSProvider):
                 },
             ],
         }
+
+    def _crea_sessione(self) -> Any:
+        sessione = requests.Session()
+        sessione.mount(
+            "https://",
+            requests.adapters.HTTPAdapter(
+                pool_connections=_POOL_CONNESSIONI,
+                pool_maxsize=_POOL_MAXSIZE,
+            ),
+        )
+        sessione.cookies.set_policy(_POLITICA_SENZA_COOKIE)
+        return sessione
+
+    def _sessione(self) -> Any:
+        """La sessione HTTP riusata, costruita al primo uso.
+
+        Pigra e non in `__init__` perche' il provider viene istanziato
+        all'avvio anche quando Azure non e' il motore configurato: costruire un
+        pool di connessioni per un provider che nessuno usera' sarebbe spreco.
+        """
+        sessione = getattr(self, "_sessione_condivisa", None)
+        if sessione is not None:
+            return sessione
+        with _lock_sessione:
+            sessione = getattr(self, "_sessione_condivisa", None)
+            if sessione is None:
+                sessione = self._crea_sessione()
+                self._sessione_condivisa = sessione
+        return sessione
 
     def _body_with_pauses(
         self,
@@ -214,7 +279,7 @@ class AzureSpeechTTSProvider(TTSProvider):
         )
 
         try:
-            response = requests.post(
+            response = self._sessione().post(
                 f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1",
                 data=ssml.encode("utf-8"),
                 headers={
