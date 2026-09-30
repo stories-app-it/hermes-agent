@@ -12,7 +12,7 @@ import http.cookiejar
 import logging
 import re
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from xml.sax.saxutils import escape
 
 import requests
@@ -86,6 +86,13 @@ _POLITICA_SENZA_COOKIE = http.cookiejar.DefaultCookiePolicy(allowed_domains=[])
 # verrebbe buttata via. Il pool di urllib3 sotto e' gia' thread-safe, quindi
 # oltre la costruzione non serve altro.
 _lock_sessione = threading.Lock()
+
+# Dimensione massima di un pezzo letto in streaming. `iter_content` restituisce
+# quello che c'e' nel buffer fino a questo tetto, senza aspettare di riempirlo:
+# 4 KiB e' abbastanza grande da non fare una chiamata per pochi byte (mp3 a
+# 160 kbps sono ~20 KB/s, cioe' ~5 pezzi al secondo di audio) e abbastanza
+# piccolo da non trattenere il primo suono in attesa di un blocco da 64 KiB.
+_STREAM_CHUNK_BYTES = 4096
 
 
 class AzureSpeechTTSProvider(TTSProvider):
@@ -225,6 +232,100 @@ class AzureSpeechTTSProvider(TTSProvider):
             )
         return paragraph_break.join(paragraph_bodies) if paragraph_break else "".join(paragraph_bodies)
 
+    def _costruisci_ssml(
+        self,
+        text: str,
+        *,
+        voice: str,
+        speed: Optional[float],
+        pitch: Optional[float],
+        volume: Optional[float],
+        style: Optional[str],
+        style_degree: Optional[float],
+        pause_sentence_ms: Optional[float],
+        pause_paragraph_ms: Optional[float],
+    ) -> str:
+        """Costruisce l'SSML della richiesta.
+
+        Estratto da `synthesize` perche' `synthesize_stream` deve inviare
+        esattamente lo stesso documento: un solo punto dove nasce, cosi' i due
+        percorsi non possono divergere.
+        """
+        body = self._body_with_pauses(text, pause_sentence_ms, pause_paragraph_ms)
+
+        prosody_attrs = []
+        if speed is not None:
+            prosody_attrs.append(f'rate="{speed:.2f}"')
+        if pitch is not None:
+            prosody_attrs.append(f'pitch="{pitch:+.0f}%"')
+        if volume is not None:
+            prosody_attrs.append(f'volume="{volume:.0f}"')
+        if prosody_attrs:
+            body = f'<prosody {" ".join(prosody_attrs)}>{body}</prosody>'
+
+        use_style = bool(style) and voice in _STYLE_CAPABLE_VOICES
+        mstts_namespace = ""
+        if use_style:
+            mstts_namespace = f' xmlns:mstts="{_MSTTS_NAMESPACE}"'
+            degree_attr = f' styledegree="{style_degree:.2f}"' if style_degree is not None else ""
+            body = f'<mstts:express-as style="{escape(style)}"{degree_attr}>{body}</mstts:express-as>'
+
+        return (
+            f'<speak version="1.0" xml:lang="{_DEFAULT_LOCALE}"{mstts_namespace}>'
+            f'<voice name="{escape(voice)}">{body}</voice>'
+            f"</speak>"
+        )
+
+    def _prepara_richiesta(
+        self,
+        text: str,
+        *,
+        voice: Optional[str],
+        speed: Optional[float],
+        format: str,
+        pitch: Optional[float],
+        volume: Optional[float],
+        style: Optional[str],
+        style_degree: Optional[float],
+        pause_sentence_ms: Optional[float],
+        pause_paragraph_ms: Optional[float],
+    ) -> tuple[str, str, Dict[str, Any]]:
+        """Regione, url e kwargs della POST, comuni a `synthesize` e stream."""
+        key, region = self._credentials()
+        voice_name = voice or _DEFAULT_VOICE
+        output_format = _OUTPUT_FORMAT_MAP.get(format, _OUTPUT_FORMAT_MAP["mp3"])
+        ssml = self._costruisci_ssml(
+            text,
+            voice=voice_name,
+            speed=speed,
+            pitch=pitch,
+            volume=volume,
+            style=style,
+            style_degree=style_degree,
+            pause_sentence_ms=pause_sentence_ms,
+            pause_paragraph_ms=pause_paragraph_ms,
+        )
+
+        logger.info(
+            "azure tts: voice=%r speed=%r pitch=%r volume=%r style=%r "
+            "style_degree=%r pause_sentence_ms=%r pause_paragraph_ms=%r ssml=%s",
+            voice_name, speed, pitch, volume, style,
+            style_degree, pause_sentence_ms, pause_paragraph_ms, ssml,
+        )
+
+        url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
+        kwargs = dict(
+            data=ssml.encode("utf-8"),
+            headers={
+                "Ocp-Apim-Subscription-Key": key,
+                "Content-Type": "application/ssml+xml",
+                "X-Microsoft-OutputFormat": output_format,
+                "User-Agent": "stories-mvp",
+            },
+            timeout=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        return region, url, kwargs
+
     def synthesize(
         self,
         text: str,
@@ -242,54 +343,15 @@ class AzureSpeechTTSProvider(TTSProvider):
         pause_paragraph_ms: Optional[float] = None,
         **extra: Any,
     ) -> str:
-        key, region = self._credentials()
-        voice_name = voice or _DEFAULT_VOICE
-        output_format = _OUTPUT_FORMAT_MAP.get(format, _OUTPUT_FORMAT_MAP["mp3"])
-
-        body = self._body_with_pauses(text, pause_sentence_ms, pause_paragraph_ms)
-
-        prosody_attrs = []
-        if speed is not None:
-            prosody_attrs.append(f'rate="{speed:.2f}"')
-        if pitch is not None:
-            prosody_attrs.append(f'pitch="{pitch:+.0f}%"')
-        if volume is not None:
-            prosody_attrs.append(f'volume="{volume:.0f}"')
-        if prosody_attrs:
-            body = f'<prosody {" ".join(prosody_attrs)}>{body}</prosody>'
-
-        use_style = bool(style) and voice_name in _STYLE_CAPABLE_VOICES
-        mstts_namespace = ""
-        if use_style:
-            mstts_namespace = f' xmlns:mstts="{_MSTTS_NAMESPACE}"'
-            degree_attr = f' styledegree="{style_degree:.2f}"' if style_degree is not None else ""
-            body = f'<mstts:express-as style="{escape(style)}"{degree_attr}>{body}</mstts:express-as>'
-
-        ssml = (
-            f'<speak version="1.0" xml:lang="{_DEFAULT_LOCALE}"{mstts_namespace}>'
-            f'<voice name="{escape(voice_name)}">{body}</voice>'
-            f"</speak>"
-        )
-
-        logger.info(
-            "azure tts: voice=%r speed=%r pitch=%r volume=%r style=%r "
-            "style_degree=%r pause_sentence_ms=%r pause_paragraph_ms=%r ssml=%s",
-            voice_name, speed, pitch, volume, style,
-            style_degree, pause_sentence_ms, pause_paragraph_ms, ssml,
+        region, url, kwargs = self._prepara_richiesta(
+            text, voice=voice, speed=speed, format=format, pitch=pitch,
+            volume=volume, style=style, style_degree=style_degree,
+            pause_sentence_ms=pause_sentence_ms,
+            pause_paragraph_ms=pause_paragraph_ms,
         )
 
         try:
-            response = self._sessione().post(
-                f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1",
-                data=ssml.encode("utf-8"),
-                headers={
-                    "Ocp-Apim-Subscription-Key": key,
-                    "Content-Type": "application/ssml+xml",
-                    "X-Microsoft-OutputFormat": output_format,
-                    "User-Agent": "stories-mvp",
-                },
-                timeout=_DEFAULT_TIMEOUT_SECONDS,
-            )
+            response = self._sessione().post(url, **kwargs)
         except requests.RequestException as exc:
             raise RuntimeError(f"azure: request failed: {exc}") from exc
 
@@ -302,3 +364,56 @@ class AzureSpeechTTSProvider(TTSProvider):
         with open(output_path, "wb") as f:
             f.write(response.content)
         return output_path
+
+    def synthesize_stream(
+        self,
+        text: str,
+        *,
+        on_chunk: Callable[[bytes], None],
+        voice: Optional[str] = None,
+        model: Optional[str] = None,
+        speed: Optional[float] = None,
+        format: str = DEFAULT_OUTPUT_FORMAT,
+        pitch: Optional[float] = None,
+        volume: Optional[float] = None,
+        style: Optional[str] = None,
+        style_degree: Optional[float] = None,
+        pause_sentence_ms: Optional[float] = None,
+        pause_paragraph_ms: Optional[float] = None,
+        **extra: Any,
+    ) -> None:
+        """Come `synthesize`, ma consegna l'audio a `on_chunk` man mano che arriva.
+
+        Stessa POST (url, header, formato, SSML) sulla stessa sessione
+        condivisa, con `stream=True`: il corpo non viene letto tutto prima di
+        restituire, quindi il chiamante puo' inoltrare i primi byte mentre
+        Azure sta ancora producendo il resto.
+        """
+        region, url, kwargs = self._prepara_richiesta(
+            text, voice=voice, speed=speed, format=format, pitch=pitch,
+            volume=volume, style=style, style_degree=style_degree,
+            pause_sentence_ms=pause_sentence_ms,
+            pause_paragraph_ms=pause_paragraph_ms,
+        )
+
+        try:
+            response = self._sessione().post(url, stream=True, **kwargs)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"azure: request failed: {exc}") from exc
+
+        # Con stream=True la connessione resta occupata finche' il corpo non e'
+        # consumato o la risposta chiusa: il finally la restituisce sempre al
+        # pool, anche se on_chunk solleva o la lettura si interrompe.
+        try:
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"azure: {region!r} returned HTTP "
+                    f"{response.status_code}: {response.text[:500]}"
+                )
+            for chunk in response.iter_content(chunk_size=_STREAM_CHUNK_BYTES):
+                if chunk:
+                    on_chunk(chunk)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"azure: stream interrupted: {exc}") from exc
+        finally:
+            response.close()
