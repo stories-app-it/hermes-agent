@@ -1796,6 +1796,29 @@ class TestBuildAnthropicKwargs:
         )
         assert "thinking" not in kwargs
 
+    @pytest.mark.parametrize("model", ["claude-haiku-5-5", "claude-sonnet-5", "claude-opus-4-7"])
+    def test_reasoning_disabled_is_explicit_on_adaptive_models(self, model):
+        # Adaptive Claude models think by default when the request is silent.
+        kwargs = build_anthropic_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "quick"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": False},
+        )
+        assert kwargs["thinking"] == {"type": "disabled"}
+
+    @pytest.mark.parametrize("model", ["claude-haiku-5-5", "claude-sonnet-5"])
+    def test_no_reasoning_config_leaves_adaptive_default(self, model):
+        kwargs = build_anthropic_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "quick"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+        )
+        assert "thinking" not in kwargs
+
     def test_default_max_tokens_uses_model_output_limit(self):
         """When max_tokens is None, use the model's native output limit."""
         kwargs = build_anthropic_kwargs(

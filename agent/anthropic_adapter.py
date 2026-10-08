@@ -2697,6 +2697,15 @@ def build_anthropic_kwargs(
                 # Anthropic requires temperature=1 when thinking is enabled on older models
                 kwargs["temperature"] = 1
                 kwargs["max_tokens"] = max(effective_max_tokens, budget + 4096)
+        elif (
+            reasoning_config.get("enabled") is False
+            and _is_claude_model(model)
+            and _supports_adaptive_thinking(model)
+        ):
+            # Adaptive Claude models (Haiku 5.5 included) think by default when
+            # the request says nothing. An explicit "off" must be sent, or the
+            # caller pays the reasoning tokens before the first text token.
+            kwargs["thinking"] = {"type": "disabled"}
 
     # ── Strip sampling params on 4.7+ ─────────────────────────────────
     # Opus 4.7 rejects any non-default temperature/top_p/top_k with a 400.
